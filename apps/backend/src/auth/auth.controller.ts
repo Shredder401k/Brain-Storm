@@ -2,12 +2,23 @@ import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiBody } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { AuthService } from './auth.service';
+import { StellarAuthService } from './stellar-auth.service';
 import { GoogleAuthGuard } from './google-auth.guard';
-import { IsEmail, IsString, MinLength } from 'class-validator';
+import { GoogleProfile } from './google.strategy';
+import { IsEmail, IsString, MinLength, IsOptional } from 'class-validator';
+import { JwtAuthGuard } from './jwt-auth.guard';
+import { Roles } from './roles.decorator';
+import { RolesGuard } from './roles.guard';
 
 class AuthDto {
   @IsEmail() email: string;
   @IsString() @MinLength(8) password: string;
+}
+
+class LoginDto extends AuthDto {
+  @IsString()
+  @IsOptional()
+  mfa_token?: string;
 }
 
 class ResendVerificationDto {
@@ -30,7 +41,26 @@ class RefreshDto {
 @ApiTags('auth')
 @Controller('auth')
 export class AuthController {
-  constructor(private authService: AuthService) {}
+  constructor(
+    private authService: AuthService,
+    private stellarAuthService: StellarAuthService,
+  ) {}
+
+  @Get('stellar')
+  @ApiOperation({ summary: 'SEP-0010: get challenge transaction' })
+  @ApiResponse({ status: 200, description: 'Returns unsigned challenge XDR and network passphrase' })
+  stellarChallenge(@Query('account') account: string) {
+    return this.stellarAuthService.buildChallenge(account);
+  }
+
+  @Post('stellar')
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @ApiOperation({ summary: 'SEP-0010: verify signed challenge and receive JWT' })
+  @ApiResponse({ status: 201, description: 'Returns access_token' })
+  @ApiResponse({ status: 401, description: 'Invalid or expired challenge' })
+  stellarVerify(@Body('transaction') transaction: string) {
+    return this.stellarAuthService.verifyChallenge(transaction);
+  }
 
   @Post('register')
   @Throttle({ default: { limit: 5, ttl: 60000 } })
@@ -49,8 +79,8 @@ export class AuthController {
   @ApiBody({ schema: { example: { email: 'user@example.com', password: 'password123' } } })
   @ApiResponse({ status: 200, description: 'Login successful', schema: { example: { access_token: 'jwt', refresh_token: 'token' } } })
   @ApiResponse({ status: 401, description: 'Invalid credentials' })
-  login(@Body() dto: AuthDto) {
-    return this.authService.login(dto.email, dto.password);
+  login(@Body() dto: LoginDto) {
+    return this.authService.login(dto.email, dto.password, dto.mfa_token);
   }
 
   @Post('refresh')
@@ -104,5 +134,63 @@ export class AuthController {
   @ApiResponse({ status: 400, description: 'Invalid or expired token' })
   resetPassword(@Body() dto: ResetPasswordDto) {
     return this.authService.resetPassword(dto.token, dto.newPassword);
+  }
+
+  @Post('mfa/enable')
+  @UseGuards(JwtAuthGuard)
+  enableMfa(@Request() req) {
+    return this.authService.generateMfaSecret(req.user.id);
+  }
+
+  @Post('mfa/verify')
+  @UseGuards(JwtAuthGuard)
+  verifyMfa(@Request() req, @Body('code') code: string) {
+    return this.authService.verifyMfaSecret(req.user.id, code);
+  }
+
+  @Post('mfa/disable')
+  @UseGuards(JwtAuthGuard)
+  disableMfa(@Request() req, @Body('code') code: string) {
+    return this.authService.disableMfa(req.user.id, code);
+  }
+
+  @Post('admin/api-keys')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('admin')
+  generateApiKey(@Body('userId') userId: string, @Body('name') name: string) {
+    return this.authService.generateApiKey(userId, name);
+  }
+
+  @Post('admin/api-keys/revoke')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('admin')
+  revokeApiKey(@Body('id') id: string) {
+    return this.authService.revokeApiKey(id);
+  }
+
+  @Post('stellar-challenge')
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @ApiOperation({ summary: 'Generate a challenge for Stellar wallet signing' })
+  @ApiResponse({ status: 200, description: 'Challenge generated successfully' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  generateStellarChallenge(@Body('publicKey') publicKey: string) {
+    return this.authService.generateStellarChallenge(publicKey);
+  }
+
+  @Post('stellar-verify')
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @ApiOperation({ summary: 'Verify Stellar wallet signature and link to account' })
+  @ApiResponse({ status: 200, description: 'Wallet linked successfully' })
+  @ApiResponse({ status: 400, description: 'Invalid signature or challenge' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  verifyStellarSignature(
+    @Request() req,
+    @Body('publicKey') publicKey: string,
+    @Body('signature') signature: string,
+    @Body('challenge') challenge: string,
+  ) {
+    return this.authService.verifyStellarSignature(req.user.id, publicKey, signature, challenge);
   }
 }

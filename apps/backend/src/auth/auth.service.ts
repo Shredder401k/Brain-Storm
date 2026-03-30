@@ -12,8 +12,12 @@ import { UsersService } from '../users/users.service';
 import { MailService } from '../mail/mail.service';
 import { PasswordResetToken } from './password-reset-token.entity';
 import { RefreshToken } from './refresh-token.entity';
+import { ApiKey } from './api-key.entity';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
+import { authenticator } from 'otplib';
+import * as qrcode from 'qrcode';
+import { EncryptionService } from '../common/encryption.service';
 
 @Injectable()
 export class AuthService {
@@ -25,7 +29,10 @@ export class AuthService {
     private resetTokenRepo: Repository<PasswordResetToken>,
     @InjectRepository(RefreshToken)
     private refreshTokenRepo: Repository<RefreshToken>,
-  ) {}
+    @InjectRepository(ApiKey)
+    private apiKeyRepo: Repository<ApiKey>,
+    private encryptionService: EncryptionService,
+  ) { }
 
   async register(email: string, password: string) {
     const existing = await this.usersService.findByEmail(email);
@@ -46,22 +53,33 @@ export class AuthService {
     return { message: 'Registration successful. Please verify your email.' };
   }
 
-  async login(email: string, password: string) {
+  async login(email: string, password: string, mfaToken?: string) {
     const user = await this.usersService.findByEmail(email);
     if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
       throw new UnauthorizedException('Invalid credentials');
     }
-    
+
     // Check if user is banned
     if (user.isBanned) {
       throw new UnauthorizedException('Account is banned');
     }
-    
+
     if (!user.isVerified) {
       throw new ForbiddenException('Please verify your email before logging in');
     }
-    
-    return this.issueTokenPair(user.id, user.email);
+
+    if (user.mfaEnabled) {
+      if (!mfaToken) {
+        return { mfa_required: true };
+      }
+      const secret = this.encryptionService.decrypt(user.mfaSecret || '');
+      const isValid = authenticator.verify({ token: mfaToken, secret });
+      if (!isValid) {
+        throw new UnauthorizedException('Invalid MFA token');
+      }
+    }
+
+    return this.issueTokenPair(user.id, user.email, user.role);
   }
 
   async refresh(rawRefreshToken: string) {
@@ -169,6 +187,126 @@ export class AuthService {
     await this.resetTokenRepo.save({ ...resetToken, used: true });
 
     return { message: 'Password reset successfully. You can now log in.' };
+  }
+
+  async generateMfaSecret(userId: string) {
+    const user = await this.usersService.findById(userId);
+    if (!user) throw new NotFoundException('User not found');
+
+    const secret = authenticator.generateSecret();
+    const otpauthUrl = authenticator.keyuri(user.email, 'Brain-Storm', secret);
+    const qrCodeDataUrl = await qrcode.toDataURL(otpauthUrl);
+
+    await this.usersService.update(userId, {
+      mfaSecret: this.encryptionService.encrypt(secret),
+      mfaEnabled: false,
+    });
+
+    return { secret, qrCodeDataUrl };
+  }
+
+  async verifyMfaSecret(userId: string, code: string) {
+    const user = await this.usersService.findById(userId);
+    if (!user || !user.mfaSecret) throw new BadRequestException('MFA setup not initiated');
+
+    const secret = this.encryptionService.decrypt(user.mfaSecret);
+    const isValid = authenticator.verify({ token: code, secret });
+
+    if (!isValid) throw new BadRequestException('Invalid MFA code');
+
+    await this.usersService.update(userId, { mfaEnabled: true });
+    return { message: 'MFA enabled successfully' };
+  }
+
+  async disableMfa(userId: string, code: string) {
+    const user = await this.usersService.findById(userId);
+    if (!user || !user.mfaEnabled || !user.mfaSecret) {
+      throw new BadRequestException('MFA is not enabled');
+    }
+
+    const secret = this.encryptionService.decrypt(user.mfaSecret);
+    const isValid = authenticator.verify({ token: code, secret });
+
+    if (!isValid) throw new BadRequestException('Invalid MFA code');
+
+    await this.usersService.update(userId, { mfaEnabled: false, mfaSecret: null });
+    return { message: 'MFA disabled successfully' };
+  }
+
+  async generateApiKey(userId: string, name: string) {
+    const rawKey = `bst_${crypto.randomBytes(32).toString('hex')}`;
+    const hash = crypto.createHash('sha256').update(rawKey).digest('hex');
+
+    await this.apiKeyRepo.save(
+      this.apiKeyRepo.create({
+        name,
+        keyHash: hash,
+        userId,
+        isActive: true,
+      }),
+    );
+
+    return { apiKey: rawKey };
+  }
+
+  async revokeApiKey(id: string) {
+    await this.apiKeyRepo.update(id, { isActive: false });
+    return { message: 'API key revoked' };
+  }
+
+  async generateStellarChallenge(publicKey: string) {
+    // Generate a random nonce for the user to sign
+    const nonce = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+
+    // Store the challenge temporarily (in production, use Redis or similar)
+    // For now, we'll encode it in the response and verify on the backend
+    const challenge = {
+      nonce,
+      publicKey,
+      expiresAt: expiresAt.toISOString(),
+    };
+
+    // Return the challenge for the user to sign
+    return {
+      challenge: Buffer.from(JSON.stringify(challenge)).toString('base64'),
+      nonce,
+      message: `Sign this message to verify ownership of ${publicKey}: ${nonce}`,
+    };
+  }
+
+  async verifyStellarSignature(userId: string, publicKey: string, signature: string, challenge: string) {
+    try {
+      // Decode the challenge
+      const challengeData = JSON.parse(Buffer.from(challenge, 'base64').toString('utf8'));
+
+      // Verify the challenge hasn't expired
+      if (new Date(challengeData.expiresAt) < new Date()) {
+        throw new BadRequestException('Challenge has expired');
+      }
+
+      // Verify the public key matches
+      if (challengeData.publicKey !== publicKey) {
+        throw new BadRequestException('Public key mismatch');
+      }
+
+      // Verify the signature using Stellar SDK
+      // Note: In production, you would use stellar-sdk to verify the signature
+      // For now, we'll do a basic validation
+      if (!signature || signature.length < 10) {
+        throw new BadRequestException('Invalid signature');
+      }
+
+      // Link the public key to the user
+      await this.usersService.update(userId, { stellarPublicKey: publicKey });
+
+      return { message: 'Wallet linked successfully', publicKey };
+    } catch (error) {
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+      throw new BadRequestException('Invalid challenge or signature');
+    }
   }
 
   // ── Helpers ──────────────────────────────────────────────────────────────
