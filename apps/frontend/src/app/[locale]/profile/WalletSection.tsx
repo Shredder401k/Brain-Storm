@@ -20,9 +20,12 @@ export default function WalletSection({ userId, stellarPublicKey, onLinked, onUn
 
   useEffect(() => {
     if (stellarPublicKey) {
-      api.get(`/stellar/balance/${stellarPublicKey}`)
+      api
+        .get(`/stellar/balance/${stellarPublicKey}`)
         .then((r) => {
-          const bst = r.data.balances?.find((b: { asset_code: string; balance: string }) => b.asset_code === 'BST');
+          const bst = r.data.balances?.find(
+            (b: { asset_code: string; balance: string }) => b.asset_code === 'BST'
+          );
           setBstBalance(bst?.balance ?? '0');
         })
         .catch(() => setBstBalance('0'));

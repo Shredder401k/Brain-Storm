@@ -122,7 +122,9 @@ export default function ProfilePage() {
   if (loading) {
     return (
       <main className="max-w-2xl mx-auto p-8 text-gray-900 dark:text-gray-100">
-        <p role="status" aria-live="polite">{t('loading')}</p>
+        <p role="status" aria-live="polite">
+          {t('loading')}
+        </p>
       </main>
     );
   }
@@ -167,7 +169,6 @@ export default function ProfilePage() {
             width={64}
             height={64}
             className="w-16 h-16 rounded-full object-cover"
-            loading="eager"
             priority
           />
         ) : (
@@ -271,7 +272,6 @@ export default function ProfilePage() {
           </p>
         </div>
 
-        {/* Live region announces save state to screen readers */}
         <div aria-live="polite" aria-atomic="true" className="sr-only">
           {saved ? t('saved') : ''}
         </div>
